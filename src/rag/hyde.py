@@ -1,0 +1,54 @@
+"""
+HYDE (Hypothetical Document Embeddings) helper.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+from ..llm.client import LLMClient, create_client
+
+
+@dataclass
+class HydeGenerator:
+    """Thin wrapper over LLMClient for HYDE-style retrieval."""
+
+    client: LLMClient
+
+    @classmethod
+    def from_env(
+        cls,
+        model_name: Optional[str] = None,
+    ) -> "HydeGenerator":
+        """Construct a HYDE generator using environment-based configuration."""
+        client = create_client(model_name=model_name)
+        return cls(client=client)
+
+    def generate_hypothetical_answer(
+        self, query: str, *, subject: Optional[str] = None
+    ) -> str:
+        """Generate a short hypothetical answer paragraph for the given query."""
+        if subject:
+            preamble = (
+                f'Given the technical question from a {subject} course: "{query}"\n'
+                f"Write a short, textbook-style paragraph from a {subject} chapter that "
+                "directly and precisely answers this question."
+            )
+        else:
+            preamble = (
+                f'Given the technical question: "{query}"\n'
+                "Write a short, textbook-style paragraph that directly and precisely answers "
+                "this question."
+            )
+        prompt = (
+            f"{preamble} Focus on the key concepts, definitions, and steps. "
+            "Limit the answer to 2-3 sentences."
+        )
+        return self.client.generate_single(
+            prompt,
+            max_tokens=256,
+            temperature=0.3,
+            top_p=0.9,
+            stop=None,
+        ).strip()

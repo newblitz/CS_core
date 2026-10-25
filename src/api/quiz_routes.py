@@ -1,0 +1,351 @@
+from __future__ import annotations
+
+import datetime as dt
+from typing import Annotated, List, Sequence
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from src.api.rate_limit import limiter
+from src.auth.dependencies import get_current_active_user
+from src.db.models import Card, ReviewAttempt, ReviewState, Topic, User, UserTopicSWOT
+from src.db.session import get_db
+from src.skills.path_planner import PathNode
+from src.skills.quiz_service import QuizService
+from src.skills.schemas import (
+    LearningPathNode,
+    QuizCard,
+    QuizSessionAnswerRequest,
+    QuizSessionAnswerResponse,
+    QuizSessionFinishResponse,
+    QuizSessionSkipResponse,
+    QuizSessionStartRequest,
+    QuizSessionStartResponse,
+    QuizStatsResponse,
+    SessionProgress,
+    TopicStats,
+)
+from src.skills.session_service import QuizSessionState
+from src.skills.swot import refresh_user_swot
+
+router = APIRouter(prefix="/api/quiz", tags=["quiz"])
+
+
+async def _refresh_swot_snapshot(
+    *,
+    db: AsyncSession,
+    user_id: int,
+    cards: Sequence[Card],
+) -> None:
+    if not cards:
+        return
+    card_ids = [card.id for card in cards]
+    states_result = await db.execute(
+        select(ReviewState).where(
+            ReviewState.user_id == user_id,
+            ReviewState.card_id.in_(card_ids),
+        )
+    )
+    attempts_result = await db.execute(
+        select(ReviewAttempt).where(
+            ReviewAttempt.user_id == user_id,
+            ReviewAttempt.card_id.in_(card_ids),
+        )
+    )
+    review_states = states_result.scalars().all()
+    review_attempts = attempts_result.scalars().all()
+    await refresh_user_swot(
+        db=db,
+        user_id=user_id,
+        cards=cards,
+        review_states=review_states,
+        review_attempts=review_attempts,
+    )
+    await db.commit()
+
+
+def _quiz_sessions_store(request: Request) -> dict[str, QuizSessionState]:
+    ttl_minutes = int(getattr(request.app.state, "quiz_session_ttl_minutes", 180))
+    max_sessions = int(getattr(request.app.state, "quiz_session_max", 2000))
+    now = dt.datetime.now(dt.timezone.utc)
+
+    store = getattr(request.app.state, "quiz_sessions", None)
+    if store is None:
+        store = {}
+        request.app.state.quiz_sessions = store
+
+    cutoff = now - dt.timedelta(minutes=ttl_minutes)
+    stale_ids = [
+        session_id for session_id, state in store.items() if state.created_at < cutoff
+    ]
+    for session_id in stale_ids:
+        store.pop(session_id, None)
+
+    if len(store) > max_sessions:
+        overflow = len(store) - max_sessions
+        oldest_ids = sorted(
+            store,
+            key=lambda session_id: store[session_id].created_at,
+        )[:overflow]
+        for session_id in oldest_ids:
+            store.pop(session_id, None)
+
+    return store
+
+
+def _to_quiz_card(card: Card, *, canonical_card_id: int | None = None) -> QuizCard:
+    canonical_id = canonical_card_id
+    if canonical_id is None:
+        canonical_id = card.variant_of_card_id or card.id
+    return QuizCard(
+        card_id=card.id,
+        canonical_card_id=canonical_id,
+        is_variant=card.id != canonical_id,
+        topic=card.topic.name if card.topic else "",  # type: ignore[union-attr]
+        question=card.question,
+        difficulty=card.difficulty,
+        question_type=card.question_type,
+    )
+
+
+def _to_path_nodes(nodes: list[PathNode]) -> list[LearningPathNode]:
+    return [
+        LearningPathNode(
+            subject=node.subject,
+            topic_key=node.topic_key,
+            display_name=node.display_name,
+            mastery_score=node.mastery_score,
+            swot_bucket=node.swot_bucket,
+            priority_score=node.priority_score,
+            prerequisite_topic_keys=node.prerequisite_topic_keys,
+        )
+        for node in nodes
+    ]
+
+
+def _progress(state: QuizSessionState) -> SessionProgress:
+    return SessionProgress(
+        current_index=state.cursor,
+        total=state.total,
+        completed=state.completed,
+    )
+
+
+@router.get("/topics", response_model=List[TopicStats])
+async def list_topics(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_active_user)],
+) -> List[TopicStats]:
+    result = await db.execute(
+        select(Topic.name, func.count(Card.id))
+        .join(Card, Card.topic_id == Topic.id)
+        .group_by(Topic.name)
+        .order_by(Topic.name)
+    )
+    rows = result.all()
+
+    return [
+        TopicStats(
+            topic=name,
+            total=count,
+            learned=0,
+            due_today=0,
+            overdue=0,
+        )
+        for name, count in rows
+    ]
+
+
+_SWOT_TTL_SECONDS = 300  # re-compute SWOT at most once per 5 minutes
+
+
+@router.get("/stats", response_model=QuizStatsResponse)
+async def get_quiz_stats(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_active_user)],
+) -> QuizStatsResponse:
+    svc = QuizService()
+    card_result = await db.execute(
+        select(Card).join(Topic).options(selectinload(Card.topic))
+    )
+    cards = card_result.scalars().unique().all()
+
+    # Only recompute SWOT when the snapshot is stale (older than TTL).
+    # This avoids a full O(n-cards) upsert on every dashboard page load.
+    now = dt.datetime.now(dt.timezone.utc)
+    swot_result = await db.execute(
+        select(UserTopicSWOT.updated_at)
+        .where(UserTopicSWOT.user_id == current_user.id)
+        .order_by(UserTopicSWOT.updated_at.desc())
+        .limit(1)
+    )
+    most_recent_swot = swot_result.scalar_one_or_none()
+    swot_is_fresh = (
+        most_recent_swot is not None
+        and (now - most_recent_swot).total_seconds() < _SWOT_TTL_SECONDS
+    )
+    if not swot_is_fresh:
+        await _refresh_swot_snapshot(
+            db=db,
+            user_id=current_user.id,
+            cards=cards,
+        )
+
+    state_result = await db.execute(
+        select(ReviewState).where(ReviewState.user_id == current_user.id)
+    )
+    review_states = state_result.scalars().all()
+
+    stats_data = svc.get_stats(
+        user_id=current_user.id,
+        cards=cards,
+        review_states=review_states,
+    )
+    topics_stats = [
+        TopicStats(
+            topic=entry["topic"],
+            total=entry["total"],
+            learned=entry["learned"],
+            due_today=entry["due_today"],
+            overdue=entry["overdue"],
+        )
+        for entry in stats_data
+    ]
+    return QuizStatsResponse(topics=topics_stats)
+
+
+@router.post("/sessions/start", response_model=QuizSessionStartResponse)
+@limiter.limit("20/minute")
+async def start_quiz_session(
+    payload: QuizSessionStartRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    request: Request,
+) -> QuizSessionStartResponse:
+    session_service = getattr(request.app.state, "session_service", None)
+    if session_service is None:
+        raise HTTPException(status_code=503, detail="Quiz service not initialized")
+    state = await session_service.start_session(
+        db=db,
+        user_id=current_user.id,
+        limit=payload.limit,
+        topics=payload.topics,
+        subject=payload.subject,
+        difficulty=payload.difficulty,
+        path_topics_ordered=payload.path_topics_ordered,
+    )
+    _quiz_sessions_store(request)[state.session_id] = state
+
+    current_card = await session_service.get_current_presented_card(
+        db=db,
+        state=state,
+    )
+    return QuizSessionStartResponse(
+        session_id=state.session_id,
+        current_card=_to_quiz_card(current_card) if current_card else None,
+        progress=_progress(state),
+        path=_to_path_nodes(state.path_nodes),
+    )
+
+
+@router.post("/sessions/{session_id}/answer", response_model=QuizSessionAnswerResponse)
+@limiter.limit("120/minute")
+async def answer_quiz_session(
+    session_id: str,
+    payload: QuizSessionAnswerRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    request: Request,
+) -> QuizSessionAnswerResponse:
+    store = _quiz_sessions_store(request)
+    state = store.get(session_id)
+    if state is None or state.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
+        )
+
+    session_service = getattr(request.app.state, "session_service", None)
+    if session_service is None:
+        raise HTTPException(status_code=503, detail="Quiz service not initialized")
+    try:
+        outcome = await session_service.submit_current_answer(
+            db=db,
+            state=state,
+            card_id=payload.card_id,
+            user_answer=payload.user_answer,
+            response_time_ms=payload.response_time_ms,
+            action=payload.action,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    return QuizSessionAnswerResponse(
+        answer=outcome.answer,
+        explanation=outcome.explanation,
+        source_chunk_id=outcome.source_chunk_id,
+        show_source_context=bool(outcome.explanation),
+        model_score=outcome.grade.score_0_5,
+        verdict=outcome.grade.verdict,
+        should_remediate=outcome.should_remediate,
+        concept_summary=outcome.concept_summary,
+        where_you_missed=outcome.where_you_missed,
+        next_due_at=(
+            outcome.updated_state.due_at.isoformat()
+            if outcome.updated_state.due_at
+            else None
+        ),
+        interval_days=outcome.updated_state.interval_days,
+        next_card=_to_quiz_card(outcome.next_card) if outcome.next_card else None,
+        progress=_progress(state),
+    )
+
+
+@router.post("/sessions/{session_id}/skip", response_model=QuizSessionSkipResponse)
+@limiter.limit("120/minute")
+async def skip_quiz_session_card(
+    session_id: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    request: Request,
+) -> QuizSessionSkipResponse:
+    store = _quiz_sessions_store(request)
+    state = store.get(session_id)
+    if state is None or state.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
+        )
+
+    session_service = getattr(request.app.state, "session_service", None)
+    if session_service is None:
+        raise HTTPException(status_code=503, detail="Quiz service not initialized")
+    try:
+        next_card = await session_service.skip_current_card(
+            db=db,
+            state=state,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    return QuizSessionSkipResponse(
+        next_card=_to_quiz_card(next_card) if next_card else None,
+        progress=_progress(state),
+    )
+
+
+@router.post("/sessions/{session_id}/finish", response_model=QuizSessionFinishResponse)
+@limiter.limit("60/minute")
+async def finish_quiz_session(
+    session_id: str,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    request: Request,
+) -> QuizSessionFinishResponse:
+    store = _quiz_sessions_store(request)
+    state = store.get(session_id)
+    if state is None or state.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Session not found"
+        )
+    store.pop(session_id, None)
+    return QuizSessionFinishResponse(status="finished", session_id=session_id)
