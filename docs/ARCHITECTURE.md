@@ -1,0 +1,332 @@
+# Architecture
+
+This document describes the CoreCS Interview Lab architecture: how the frontend, API, database, RAG pipeline, and quiz system fit together.
+
+## Overview
+
+The app has three main subsystems:
+
+1. **RAG API** — Hybrid retrieval (BM25 + dense embeddings) with citation-backed chat and search
+2. **Quiz system** — Spaced repetition sessions, LLM grading, learning path ordering
+3. **Offline pipeline** — Generate questions from chunks, score and validate, seed into the database
+
+All of this sits behind a FastAPI backend and a React SPA frontend.
+
+## System Architecture
+
+```mermaid
+flowchart TB
+    subgraph Frontend [Frontend SPA]
+        Landing[LandingPage]
+        Dashboard[DashboardPage]
+        Setup[ReviewSetupPage]
+        Path[LearningPathPage]
+        Review[ReviewPage]
+        Summary[ReviewSummaryPage]
+        Auth[LoginPage SignupPage]
+    end
+
+    subgraph API [FastAPI Backend]
+        AuthRoutes[auth routes]
+        RAGRoutes[RAG routes]
+        QuizRoutes[quiz routes]
+        Agent[RAGAgent]
+        SessionService[QuizSessionService]
+        PathPlanner[LearningPathPlanner]
+    end
+
+    subgraph Data [Data Layer]
+        Postgres[(PostgreSQL)]
+        Chunks[(chunks.jsonl)]
+        Embeddings[(embeddings_cache)]
+    end
+
+    Frontend --> AuthRoutes
+    Frontend --> RAGRoutes
+    Frontend --> QuizRoutes
+    AuthRoutes --> Postgres
+    RAGRoutes --> Agent
+    QuizRoutes --> SessionService
+    SessionService --> PathPlanner
+    SessionService --> Postgres
+    PathPlanner --> Postgres
+    Agent --> Chunks
+    Agent --> Embeddings
+```
+
+## Quiz Session Flow
+
+When a user starts a review session, the frontend sends topics (and optionally an ordered list of topic keys from the learning path). The backend loads cards, fetches review states, builds a path order, sorts cards by that order, and serves them one at a time. Each answer is graded by the LLM and the scheduler updates the review state.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant ReviewPage
+    participant QuizAPI
+    participant SessionService
+    participant PathPlanner
+    participant QuizService
+    participant Grader
+    participant DB
+
+    User->>ReviewPage: Start session from path
+    ReviewPage->>QuizAPI: POST /sessions/start with path_topics_ordered
+    QuizAPI->>SessionService: start_session
+    SessionService->>DB: Load cards, review states
+    SessionService->>PathPlanner: build_path
+    PathPlanner->>DB: UserTopicMastery, UserTopicSWOT, Taxonomy, Prereqs
+    PathPlanner-->>SessionService: ordered path nodes
+    SessionService->>QuizService: get_next_cards
+    QuizService-->>SessionService: due cards
+    SessionService->>SessionService: Sort by path_rank
+    SessionService-->>QuizAPI: QuizSessionState
+    QuizAPI-->>ReviewPage: session_id, current_card, path
+
+    User->>ReviewPage: Submit answer
+    ReviewPage->>QuizAPI: POST /sessions/id/answer
+    QuizAPI->>SessionService: answer_card
+    SessionService->>Grader: grade_answer
+    Grader-->>SessionService: GradeResult
+    SessionService->>DB: Update ReviewState, create ReviewAttempt
+    SessionService-->>QuizAPI: next_card, feedback
+    QuizAPI-->>ReviewPage: answer, verdict, next_card
+
+    User->>ReviewPage: Click "Don't know"
+    ReviewPage->>QuizAPI: POST /sessions/id/answer {action: "dont_know"}
+    QuizAPI->>SessionService: answer_card (action=dont_know)
+    SessionService->>SessionService: Fixed GradeResult(score=0, verdict=dont_know)
+    SessionService->>DB: Update ReviewState (SM-2 quality=0), create ReviewAttempt
+    SessionService-->>QuizAPI: next_card, feedback with reference answer
+    QuizAPI-->>ReviewPage: verdict=dont_know, next_card
+
+    User->>ReviewPage: Click "Skip"
+    ReviewPage->>QuizAPI: POST /sessions/id/skip
+    QuizAPI->>SessionService: skip_current_card
+    SessionService->>SessionService: Advance cursor (no DB writes)
+    SessionService-->>QuizAPI: next_card, progress
+    QuizAPI-->>ReviewPage: next_card (no feedback shown)
+```
+
+## RAG Pipeline
+
+The RAG system uses hybrid retrieval: BM25 for lexical search, dense embeddings for semantic search, and RRF (Reciprocal Rank Fusion) to merge results. Optional components include a cross-encoder reranker, query rewriting, and HYDE (hypothetical document embeddings). The orchestrator agent decides whether retrieval is needed and runs single-hop or multi-hop retrieval before generating the answer.
+
+```mermaid
+flowchart LR
+    subgraph Input
+        Query[User Query]
+    end
+
+    subgraph Agent [RAG Agent]
+        Analyzer[QueryAnalyzer]
+        Retriever[HybridSearcher]
+        Generator[AnswerGenerator]
+    end
+
+    subgraph Hybrid [Hybrid Searcher]
+        BM25[BM25 Index]
+        Dense[Dense Index]
+        RRF[RRF Merge]
+        Reranker[CrossEncoder Reranker]
+    end
+
+    Query --> Analyzer
+    Analyzer -->|needs retrieval| Retriever
+    Retriever --> BM25
+    Retriever --> Dense
+    BM25 --> RRF
+    Dense --> RRF
+    RRF --> Reranker
+    Reranker --> Generator
+    Generator --> Answer[Answer with Citations]
+```
+
+## Data Model
+
+Core entities for the quiz system: users, topics, cards, review states, and review attempts. The learning path depends on taxonomy, prerequisites, per-user mastery, and per-user SWOT scores.
+
+```mermaid
+erDiagram
+    User ||--o{ ReviewState : has
+    User ||--o{ ReviewAttempt : has
+    User ||--o{ UserTopicMastery : has
+    User ||--o{ UserTopicSWOT : has
+
+    Topic ||--o{ Card : has
+    Card ||--o{ ReviewState : has
+    Card ||--o{ ReviewAttempt : "answered"
+    Card ||--o{ ReviewAttempt : "served_as"
+
+    TopicTaxonomyNode ||--o{ TopicPrerequisite : "prereq_for"
+    TopicPrerequisite }o--|| TopicTaxonomyNode : "prereq_of"
+
+    User {
+        int id PK
+        string email
+        string username
+    }
+
+    Topic {
+        int id PK
+        string name
+    }
+
+    Card {
+        int id PK
+        int topic_id FK
+        string question
+        string answer
+        string topic_key
+        string difficulty
+        string question_type
+        int source_chunk_id FK
+        json tags
+        int variant_of_card_id FK
+        string generation_origin
+        json provenance_json
+        json atomic_facts
+        datetime created_at
+    }
+
+    ReviewState {
+        int id PK
+        int user_id FK
+        int card_id FK
+        int interval_days
+        datetime due_at
+        int repetitions
+        float ease_factor
+        datetime last_reviewed_at
+        int lapses
+    }
+
+    UserTopicMastery {
+        int user_id FK
+        string subject
+        string topic_key
+        float mastery_score
+    }
+
+    UserTopicSWOT {
+        int user_id FK
+        string subject
+        string topic_key
+        string primary_bucket
+    }
+```
+
+## Frontend Routes
+
+The app uses React Router with nested routes. Protected routes (dashboard, review flow) require authentication. The review flow is: setup (pick topics/limit) -> learning path (optional, shows node graph) -> review (answer questions) -> summary.
+
+```mermaid
+flowchart TD
+    Root
+    Landing[LandingPage]
+
+    Protected[ProtectedRoute]
+    Dashboard[DashboardPage]
+    Setup[ReviewSetupPage]
+    Path[LearningPathPage]
+    Review[ReviewPage]
+    Summary[ReviewSummaryPage]
+
+    Auth[Auth Shell]
+    Login[LoginPage]
+    Signup[SignupPage]
+
+    Root --> Landing
+    Root --> Protected
+    Root --> Auth
+
+    Protected --> Dashboard
+    Protected --> Setup
+    Protected --> Path
+    Protected --> Review
+    Protected --> Summary
+
+    Auth --> Login
+    Auth --> Signup
+
+    Setup -->|navigate| Path
+    Path -->|click node| Review
+    Review -->|finish| Summary
+```
+
+## Offline QA Pipeline
+
+Cards are not written by hand. The pipeline generates candidate questions from chunks, scores them with an LLM, validates format and quality, and seeds the database. The topic dependency graph (taxonomy and prerequisites) is built and synced separately.
+
+```mermaid
+flowchart LR
+    subgraph Input
+        Chunks[chunks.jsonl]
+        Taxonomy[topic_graph JSON]
+    end
+
+    subgraph Eval [eval.generation]
+        Generate[batch_generate]
+        Score[score_questions]
+        Validate[validate_qa]
+    end
+
+    subgraph Scripts
+        BuildGraph[build_topic_dependency_graph]
+        SyncGraph[sync_topic_dependency_graph]
+        Seed[seed_cards]
+    end
+
+    subgraph Output
+        DB[(PostgreSQL)]
+    end
+
+    Chunks --> Generate
+    Generate --> Score
+    Score --> Validate
+    Validate --> Seed
+    Seed --> DB
+
+    Taxonomy --> BuildGraph
+    BuildGraph --> SyncGraph
+    SyncGraph --> DB
+```
+
+## New User Flow and Card Loading
+
+For a new user, cards are loaded on demand. There is no pre-warming. The flow:
+
+1. **Dashboard** — `getStats()` and `getTopics()` run. `getTopics()` returns topic names from `Topic` that have at least one `Card`. If the DB has no cards (no seed run), `availableTopics` is empty and "Start with selection" is disabled.
+2. **Setup** — User picks topics and limit, then clicks "Preview learning path". This goes to Learning Path.
+3. **Learning Path** — Calls `startQuizSession` to preview. The backend:
+   - Loads cards filtered by topics
+   - Calls `refresh_user_swot` (creates `UserTopicMastery` and `UserTopicSWOT` for this user from the cards)
+   - Calls `path_planner.build_path` (builds path from mastery, SWOT, taxonomy, prerequisites)
+   - Calls `quiz_service.get_next_cards` (for a new user, all cards are "new" since they have no `ReviewState`)
+   - Returns path nodes and the first card
+4. **Review** — User either clicks a node or "Start anyway". `startQuizSession` runs again with the same scope; cards are served in path order.
+
+**Why a new user may see no cards or be blocked:**
+
+- **No cards seeded** — If `scripts.seed_cards --apply` was never run, `getTopics()` returns `[]`, the dashboard shows "No topics available", and the user cannot start.
+- **Topic dependency graph not synced** — If `sync_topic_dependency_graph` was never run, `topic_taxonomy_nodes` and `topic_prerequisites` are empty. The path planner still uses mastery and SWOT, which are created by `refresh_user_swot` during the first `getStats()` or session start, so path nodes are built. Cards are still returned.
+- **Empty path** — When `path_nodes` is empty, the Learning Path page shows "No path nodes available" and "Start anyway". That sends the user to Review with `topics` in state; the backend loads cards with no path ordering.
+- **Direct `/review` without state** — If the user opens `/review` with no route state (e.g. bookmark, back), `orderedTopics` is empty and the request has `topics: undefined`. The backend then loads all cards with no topic filter, so cards are still returned.
+
+**Summary:** New users get cards as long as the DB has been seeded. The main blocker is an empty DB (no seed). Ensure `seed_cards --apply` has been run before testing with a new user.
+
+---
+
+## Key Directories
+
+| Path                | Purpose                                             |
+| ------------------- | --------------------------------------------------- |
+| `src/api/`          | FastAPI app, routes, CORS, lifespan                 |
+| `src/auth/`         | JWT auth, signup, login, session                    |
+| `src/db/`           | SQLAlchemy models, async session                    |
+| `src/rag/`          | BM25, dense index, hybrid search, reranker          |
+| `src/orchestrator/` | RAG agent, query analysis, answer generation        |
+| `src/skills/`       | Quiz session, path planner, grader, scheduler, SWOT |
+| `src/generation/`   | Answer generation, context building, citations      |
+| `eval/generation/`  | Offline QA generation, scoring, validation          |
+| `scripts/`          | Chunking, graph building, seeding                   |
+| `frontend/src/`     | React app, routes, API client, UI components        |

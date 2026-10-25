@@ -1,0 +1,159 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  background: var(--bg-soft);
+  background-attachment: fixed;
+  color: var(--text);
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.24;
+  background: var(--grain-noise);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  margin: 0;
+  font-family: var(--font-display);
+  letter-spacing: 0.01em;
+  color: var(--text-strong);
+}
+
+p,
+ul,
+ol {
+  margin: 0;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  border-radius: var(--radius-pill);
+  border: 1px solid rgba(57, 212, 199, 0.3);
+  background: var(--accent);
+  color: #07131b;
+  box-shadow: 0 10px 24px rgba(8, 24, 33, 0.28);
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    transform 180ms ease,
+    box-shadow 180ms ease;
+}
+
+button:hover:not(:disabled) {
+  background: var(--accent-strong);
+  border-color: rgba(235, 246, 255, 0.26);
+  transform: translateY(-1px);
+  box-shadow: 0 14px 30px rgba(6, 20, 27, 0.34);
+}
+
+button:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus-strong);
+}
+
+button:disabled {
+  opacity: 0.56;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  text-underline-offset: 0.15em;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+a:focus-visible {
+  outline: 2px solid rgba(57, 212, 199, 0.66);
+  outline-offset: 2px;
+  text-decoration: underline;
+}
+
+table {
+  width: 100%;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  background: var(--card);
+}
+
+thead {
+  background: rgba(20, 30, 42, 0.9);
+}
+
+tbody tr:nth-child(even) {
+  background: rgba(20, 30, 42, 0.66);
+}
+
+tbody tr:hover {
+  background: rgba(24, 36, 50, 0.92);
+}
+
+input,
+textarea {
+  background: var(--card-soft);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  color: var(--text);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--muted);
+}
+
+input:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--shadow-focus-strong);
+}
+
+:where(a, button, input, textarea, select, summary, [role='button']):focus-visible {
+  outline: 2px solid rgba(57, 212, 199, 0.66);
+  outline-offset: 2px;
+}
+
+::selection {
+  color: #021016;
+  background: rgba(57, 212, 199, 0.72);
+}
